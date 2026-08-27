@@ -3,6 +3,7 @@ package platform.handheld
 import chisel3._
 import chisel3.util._
 import _root_.circt.stage.ChiselStage
+import lib.audio.{AudioResampler, AudioResamplerParams}
 import lib.mem.sdram.{BurstSdramController, Signals => SdramSignals}
 import lib.mem.{HandshakeMemoryCdc, MemoryArbiter, MemoryInterface, MemoryMap, PipelineInterfaceBridge, PipelineMemoryArbiter, PipelineMemoryBurstCdc, PipelineMemoryInterface, RegisterMap}
 import lib.video.{Color, ColorARGB, ColorCorrection, ColorGrayscale}
@@ -451,6 +452,9 @@ class HandheldTop[T <: Module with HandheldModule](genT: => T, revision: Revisio
     val framebufferReadAddress = Wire(UInt(log2Ceil(videoWidth * videoHeight).W))
     val overlayReadAddress = Wire(UInt(log2Ceil(overlayWidth * overlayHeight).W))
 
+    // Raw audio CDC for the HDMI path: in docked mode clock_av is the external 27.027 MHz
+    // HDMI clock, which is not derived from the MMCM VCO, so the exact-ratio resampler
+    // below does not apply.
     val audioData = XpmCdcHandshake.continuous(clock, Cat(module.io.audio.left.asUInt, module.io.audio.right.asUInt))
     val audioDataLeft = audioData(31, 16)
     val audioDataRight = audioData(15, 0)
@@ -554,8 +558,22 @@ class HandheldTop[T <: Module with HandheldModule](genT: => T, revision: Revisio
         channels = 2,
       ))
     io.dac := audioTransmitter.io.signals
-    audioTransmitter.io.dataLeft := audioDataLeft
-    audioTransmitter.io.dataRight := audioDataRight
+
+    // Anti-aliased resampling from the core's native rate to the DAC sample rate.
+    // The CIC front end runs in the core clock domain; the rest runs in this AV domain,
+    // paced by the transmitter's sampleEnable.
+    val audioResampler = Module(new AudioResampler(AudioResamplerParams(
+      sysClockDivider = module.io.clocks.sysDivider,
+      avClockDivider = revision.dpiClockDivider,
+      audioMclkFactor = revision.audioMclkFactor,
+    )))
+    audioResampler.io.coreClock := clock
+    audioResampler.io.coreReset := reset.asBool
+    audioResampler.io.coreLeft := module.io.audio.left
+    audioResampler.io.coreRight := module.io.audio.right
+    audioResampler.io.sampleEnable := audioTransmitter.io.sampleEnable
+    audioTransmitter.io.dataLeft := audioResampler.io.left.asUInt
+    audioTransmitter.io.dataRight := audioResampler.io.right.asUInt
 
     /**
      * HDMI audio and video signal output
@@ -573,6 +591,7 @@ class HandheldTop[T <: Module with HandheldModule](genT: => T, revision: Revisio
     when (hdmiEnable) {
       dpiDriver.reset := true.B
       audioTransmitter.reset := true.B
+      audioResampler.reset := true.B
       val screenWidth = 720
       val screenHeight = 480
 
