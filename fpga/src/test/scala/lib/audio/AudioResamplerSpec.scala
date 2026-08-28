@@ -145,6 +145,64 @@ class RateInterpolatorSpec extends AnyFunSuite {
       }
     }
   }
+
+  test("re-locks after output stalls and dropped inputs") {
+    simulate(new RateInterpolator(18, 304, 77)) { dut =>
+      dut.reset.poke(true)
+      dut.clock.step()
+      dut.reset.poke(false)
+
+      // Ramp input: interpolated outputs advance by slope * 304/77 per output sample.
+      val slope = 100
+      val outSlope = slope * 304.0 / 77.0
+      var pushed = 0
+      def push(n: Int): Unit = for (_ <- 0 until n) {
+        dut.io.inValid.poke(true)
+        dut.io.inLeft.poke((pushed * slope).S)
+        dut.io.inRight.poke((pushed * slope).S)
+        dut.clock.step()
+        dut.io.inValid.poke(false)
+        pushed += 1
+      }
+      // One output period: nominal input cadence plus an outEnable pulse; returns the
+      // new output sample if the interpolator produced one (it holds off while locking).
+      def tick(pushes: Int = 4): Option[Double] = {
+        push(pushes)
+        dut.io.outEnable.poke(true)
+        dut.clock.step()
+        dut.io.outEnable.poke(false)
+        var got: Option[Double] = None
+        for (_ <- 0 until 20) {
+          if (dut.io.outValid.peek().litToBoolean) {
+            got = Some(dut.io.outLeft.peek().litValue.toDouble)
+          }
+          dut.clock.step()
+        }
+        got
+      }
+      def assertLocked(label: String): Unit = {
+        val outs = (0 until 30).flatMap(_ => tick())
+        assert(outs.length >= 10, s"$label: too few outputs (${outs.length})")
+        val deltas = outs.takeRight(10).sliding(2).map(p => p(1) - p(0)).toSeq
+        for (d <- deltas) {
+          assert(math.abs(d - outSlope) < 8.0, s"$label: output delta $d, expected ~$outSlope")
+        }
+      }
+
+      push(12)
+      assertLocked("initial lock")
+
+      // Output stall: inputs keep arriving with no consumption until the ring overruns,
+      // which must flush and re-lock rather than latch up.
+      for (_ <- 0 until 8) push(4)
+      assertLocked("after output stall")
+
+      // Input starvation: under-deliver until occupancy falls through the window guard,
+      // which must also flush and re-lock.
+      for (_ <- 0 until 8) tick(pushes = 3)
+      assertLocked("after dropped inputs")
+    }
+  }
 }
 
 class AudioResamplerElaborationSpec extends AnyFunSuite {
