@@ -572,8 +572,12 @@ class HandheldTop[T <: Module with HandheldModule](genT: => T, revision: Revisio
     audioResampler.io.coreLeft := module.io.audio.left
     audioResampler.io.coreRight := module.io.audio.right
     audioResampler.io.sampleEnable := audioTransmitter.io.sampleEnable
-    audioTransmitter.io.dataLeft := audioResampler.io.left.asUInt
-    audioTransmitter.io.dataRight := audioResampler.io.right.asUInt
+    // The analog outputs measure phase-inverted relative to original consoles,
+    // invert the DAC polarity to match.
+    def dacPolarity(x: SInt): UInt =
+      Mux(x === (-32768).S, 32767.S(16.W), (-x)(15, 0).asSInt).asUInt
+    audioTransmitter.io.dataLeft := dacPolarity(audioResampler.io.left)
+    audioTransmitter.io.dataRight := dacPolarity(audioResampler.io.right)
     // Flush buffered audio whenever the core is soft-reset (module swap) or the display
     // switches to HDMI, so no stale samples replay when the chain restarts.
     val moduleInReset = XpmCdcSingle(clock, !controlRegister.moduleReset)
