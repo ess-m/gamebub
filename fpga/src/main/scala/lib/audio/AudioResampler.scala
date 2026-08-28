@@ -71,8 +71,8 @@ case class AudioResamplerParams(
  *     transmitter sampleEnable at the exact rational phase increment; interpolation images
  *     are suppressed by >= ~55 dB at 4x oversampling.
  *
- *  5. '''DC blocker''': one-pole highpass (fc ~= 7.5 Hz at 48 kHz, shift-based, no
- *     multiplier), the digital equivalent of the hardware's AC coupling.
+ *  5. '''DC blocker''' ([[DcBlocker]]): one-pole highpass (~7.5 Hz), the digital
+ *     equivalent of the hardware's AC coupling.
  *
  * End-to-end latency is ~230 us, dominated by the FIR group delay (37 taps at 190.7 kHz).
  */
@@ -140,15 +140,11 @@ class AudioResampler(params: AudioResamplerParams) extends Module {
   interpolator.io.inRight := firRight.io.out.bits
   interpolator.io.outEnable := io.sampleEnable
 
-  // One-pole DC blocker: y[n] = x[n] - x[n-1] + (1 - 2^-10) * y[n-1].
   private def dcBlock(x: SInt, tick: Bool): SInt = {
-    val xPrev = RegInit(0.S(interpolator.outputBits.W))
-    val y = RegInit(0.S((interpolator.outputBits + 3).W))
-    when (tick) {
-      xPrev := x
-      y := (x -& xPrev) +& (y - (y >> 10).asSInt)
-    }
-    y
+    val blocker = Module(new DcBlocker(interpolator.outputBits))
+    blocker.io.tick := tick
+    blocker.io.in := x
+    blocker.io.out
   }
   io.left := FirFilter.saturate(dcBlock(interpolator.io.outLeft, interpolator.io.outValid), inputBits)
   io.right := FirFilter.saturate(dcBlock(interpolator.io.outRight, interpolator.io.outValid), inputBits)
