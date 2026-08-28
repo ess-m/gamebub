@@ -2,7 +2,7 @@ package lib.audio
 
 import chisel3._
 import chisel3.util._
-import xilinx.XpmFifoAsync
+import xilinx.{XpmCdcSingle, XpmFifoAsync}
 
 /**
  * Configuration for [[AudioResampler]].
@@ -103,49 +103,60 @@ class AudioResampler(params: AudioResamplerParams) extends Module {
 
     /** AV clock domain (implicit module clock) */
     val sampleEnable = Input(Bool())
+    /** Discards all buffered audio and restarts the chain (core reset, display switch). */
+    val flush = Input(Bool())
     val left = Output(SInt(inputBits.W))
     val right = Output(SInt(inputBits.W))
   })
 
+  // The flush covers both domains: the CIC front end and FIFO restart from the core
+  // side, the filter chain from the AV side.
+  val coreFlush = withClockAndReset(io.coreClock, io.coreReset) {
+    XpmCdcSingle(clock, io.flush)
+  }
+
   val fifo = Module(new XpmFifoAsync(UInt((2 * intermediateBits).W), 16))
   fifo.io.writeClock := io.coreClock
   fifo.io.readClock := clock
-  fifo.io.reset := io.coreReset
+  fifo.io.reset := io.coreReset || coreFlush
 
   // Core clock domain: CIC decimation down to the intermediate rate.
-  withClockAndReset(io.coreClock, io.coreReset) {
+  withClockAndReset(io.coreClock, io.coreReset || coreFlush) {
     val cicLeft = Module(new CicDecimator(inputBits, params.cicDecimation, intermediateBits))
     val cicRight = Module(new CicDecimator(inputBits, params.cicDecimation, intermediateBits))
     cicLeft.io.input := io.coreLeft
     cicRight.io.input := io.coreRight
     fifo.io.dataIn := Cat(cicLeft.io.output.bits.asUInt, cicRight.io.output.bits.asUInt)
-    fifo.io.writeEnable := cicLeft.io.output.valid && !fifo.io.full && !fifo.io.writeResetBusy
+    fifo.io.writeEnable := cicLeft.io.output.valid && !fifo.io.full && !fifo.io.writeResetBusy &&
+      !coreFlush
   }
 
-  // AV clock domain: FIR filtering at the intermediate rate.
-  val firLeft = Module(new FirFilter(intermediateBits, coeffBits, firCoeffs))
-  val firRight = Module(new FirFilter(intermediateBits, coeffBits, firCoeffs))
-  val firReady = firLeft.io.ready && firRight.io.ready
-  val consume = !fifo.io.empty && !fifo.io.readResetBusy && firReady
-  fifo.io.readEnable := consume
-  firLeft.io.in.valid := consume
-  firLeft.io.in.bits := fifo.io.dataOut(2 * intermediateBits - 1, intermediateBits).asSInt
-  firRight.io.in.valid := consume
-  firRight.io.in.bits := fifo.io.dataOut(intermediateBits - 1, 0).asSInt
+  withReset(reset.asBool || io.flush) {
+    // AV clock domain: FIR filtering at the intermediate rate.
+    val firLeft = Module(new FirFilter(intermediateBits, coeffBits, firCoeffs))
+    val firRight = Module(new FirFilter(intermediateBits, coeffBits, firCoeffs))
+    val firReady = firLeft.io.ready && firRight.io.ready
+    val consume = !fifo.io.empty && !fifo.io.readResetBusy && firReady && !io.flush
+    fifo.io.readEnable := consume
+    firLeft.io.in.valid := consume
+    firLeft.io.in.bits := fifo.io.dataOut(2 * intermediateBits - 1, intermediateBits).asSInt
+    firRight.io.in.valid := consume
+    firRight.io.in.bits := fifo.io.dataOut(intermediateBits - 1, 0).asSInt
 
-  // Fractional resampling to the DAC rate.
-  val interpolator = Module(new RateInterpolator(intermediateBits, params.phaseNum, params.phaseDen))
-  interpolator.io.inValid := firLeft.io.out.valid
-  interpolator.io.inLeft := firLeft.io.out.bits
-  interpolator.io.inRight := firRight.io.out.bits
-  interpolator.io.outEnable := io.sampleEnable
+    // Fractional resampling to the DAC rate.
+    val interpolator = Module(new RateInterpolator(intermediateBits, params.phaseNum, params.phaseDen))
+    interpolator.io.inValid := firLeft.io.out.valid
+    interpolator.io.inLeft := firLeft.io.out.bits
+    interpolator.io.inRight := firRight.io.out.bits
+    interpolator.io.outEnable := io.sampleEnable
 
-  private def dcBlock(x: SInt, tick: Bool): SInt = {
-    val blocker = Module(new DcBlocker(interpolator.outputBits))
-    blocker.io.tick := tick
-    blocker.io.in := x
-    blocker.io.out
+    def dcBlock(x: SInt, tick: Bool): SInt = {
+      val blocker = Module(new DcBlocker(interpolator.outputBits))
+      blocker.io.tick := tick
+      blocker.io.in := x
+      blocker.io.out
+    }
+    io.left := FirFilter.saturate(dcBlock(interpolator.io.outLeft, interpolator.io.outValid), inputBits)
+    io.right := FirFilter.saturate(dcBlock(interpolator.io.outRight, interpolator.io.outValid), inputBits)
   }
-  io.left := FirFilter.saturate(dcBlock(interpolator.io.outLeft, interpolator.io.outValid), inputBits)
-  io.right := FirFilter.saturate(dcBlock(interpolator.io.outRight, interpolator.io.outValid), inputBits)
 }

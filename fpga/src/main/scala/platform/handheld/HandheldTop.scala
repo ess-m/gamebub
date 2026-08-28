@@ -574,6 +574,10 @@ class HandheldTop[T <: Module with HandheldModule](genT: => T, revision: Revisio
     audioResampler.io.sampleEnable := audioTransmitter.io.sampleEnable
     audioTransmitter.io.dataLeft := audioResampler.io.left.asUInt
     audioTransmitter.io.dataRight := audioResampler.io.right.asUInt
+    // Flush buffered audio whenever the core is soft-reset (module swap) or the display
+    // switches to HDMI, so no stale samples replay when the chain restarts.
+    val moduleInReset = XpmCdcSingle(clock, !controlRegister.moduleReset)
+    audioResampler.io.flush := moduleInReset
 
     /**
      * HDMI audio and video signal output
@@ -591,7 +595,7 @@ class HandheldTop[T <: Module with HandheldModule](genT: => T, revision: Revisio
     when (hdmiEnable) {
       dpiDriver.reset := true.B
       audioTransmitter.reset := true.B
-      audioResampler.reset := true.B
+      audioResampler.io.flush := true.B
       val screenWidth = 720
       val screenHeight = 480
 
