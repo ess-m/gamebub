@@ -6,16 +6,17 @@ import lib.util.EphemeralSimulator._
 import org.scalatest.funsuite.AnyFunSuite
 
 /**
- * Full-chain harness at GBA rev4 rates, single clock domain (the async FIFO is
+ * Full-chain harness at the shipped rates, single clock domain (the async FIFO is
  * bypassed; rates and logic are otherwise identical to AudioResampler).
  *
  * A square-wave generator drives the CIC at the core rate; an exact rational
- * accumulator fires outEnable at the DAC rate (7/2432 of core cycles).
+ * accumulator fires outEnable at the DAC rate.
  */
 
-class ResamplerChainHarness(squareHalfPeriod: Int, coeffs: Seq[BigInt]) extends Module {
+class ResamplerChainHarness(params: AudioResamplerParams, squareHalfPeriod: Int) extends Module {
+  private val outBits = params.intermediateBits + 1
   val io = IO(new Bundle {
-    val out = Output(SInt(19.W))
+    val out = Output(SInt(outBits.W))
     val outSeq = Output(UInt(32.W))
   })
 
@@ -30,27 +31,27 @@ class ResamplerChainHarness(squareHalfPeriod: Int, coeffs: Seq[BigInt]) extends 
   }
   val square = Mux(level, 16384.S(16.W), (-16384).S(16.W))
 
-  val cic = Module(new CicDecimator(16, 88, 18))
+  val cic = Module(new CicDecimator(params.inputBits, params.cicDecimation, params.intermediateBits))
   cic.io.input := square
 
-  val fir = Module(new FirFilter(18, 18, coeffs))
+  val fir = Module(new FirFilter(params.intermediateBits, params.coeffBits, params.firCoeffs))
   fir.io.in.valid := cic.io.output.valid
   fir.io.in.bits := cic.io.output.bits
   assert(!(cic.io.output.valid && !fir.io.ready), "FIR not ready for CIC sample")
 
-  val interp = Module(new RateInterpolator(18, 304, 77))
+  val interp = Module(new RateInterpolator(params.intermediateBits, params.phaseNum, params.phaseDen))
   interp.io.inValid := fir.io.out.valid
   interp.io.inLeft := fir.io.out.bits
   interp.io.inRight := fir.io.out.bits
 
-  // outEnable at exactly (7/2432) * coreClock = 48293.08 Hz.
-  val acc = RegInit(0.U(13.W))
-  val next = acc +& 7.U
-  val fire = next >= 2432.U
-  acc := Mux(fire, next - 2432.U, next)
+  // outEnable at exactly (corePerOutputDen / corePerOutputNum) * coreClock.
+  val acc = RegInit(0.U(log2Ceil(params.corePerOutputNum + params.corePerOutputDen).W))
+  val next = acc +& params.corePerOutputDen.U
+  val fire = next >= params.corePerOutputNum.U
+  acc := Mux(fire, next - params.corePerOutputNum.U, next)
   interp.io.outEnable := fire
 
-  val outReg = RegInit(0.S(19.W))
+  val outReg = RegInit(0.S(outBits.W))
   val outSeq = RegInit(0.U(32.W))
   when (interp.io.outValid) {
     outReg := interp.io.outLeft
@@ -61,17 +62,10 @@ class ResamplerChainHarness(squareHalfPeriod: Int, coeffs: Seq[BigInt]) extends 
 }
 
 class ResamplerChainSpec extends AnyFunSuite {
-  private val coreHz = 50_000_000.0 / 3.0 * 56.375 / 56.0
-  private val outHz = coreHz * 7.0 / 2432.0
-
-  private val chainDcGain = 0.89
-  private val coeffs = FirDesign.kaiserLowpass(
-    numTaps = 75,
-    cutoffNorm = 23_000.0 / (coreHz / 88.0),
-    beta = 6.0,
-    dcGain = chainDcGain / CicDecimator.gain(16, 3, 88, 18),
-    coeffBits = 18,
-  )
+  // The shipped design point (GBA, rev 4).
+  private val params = AudioResamplerParams(56, 32, 608)
+  private val coreHz = params.coreClockHz
+  private val outHz = params.outputRateHz
 
   /** Hann-windowed Goertzel amplitude at frequency f (Hz) over samples at rate fs. */
   private def goertzel(samples: Seq[Double], f: Double, fs: Double): Double = {
@@ -101,7 +95,7 @@ class ResamplerChainSpec extends AnyFunSuite {
     val numSamples = 4096
     val captured = new scala.collection.mutable.ArrayBuffer[Double](numSamples)
 
-    simulate(new ResamplerChainHarness(halfPeriod, coeffs)) { dut =>
+    simulate(new ResamplerChainHarness(params, halfPeriod)) { dut =>
       dut.reset.poke(true)
       dut.clock.step()
       dut.reset.poke(false)
@@ -140,9 +134,11 @@ class ResamplerChainSpec extends AnyFunSuite {
     println(f"NEW path: fundamental ${db(newFund)}%.1f dB, alias ${db(newAlias)}%.1f dB (rel: ${db(newAlias / newFund)}%.1f dB)")
 
     // Interpolator phase-slip check: an occupancy stall in the consume pattern
-    // phase-modulates the signal at 4 * fOut / 77 (~2509 Hz) and its harmonics,
-    // producing sidebands at that comb +/- f0.
-    val slipRate = 4.0 * outHz / 77.0
+    // phase-modulates the signal at (slip events per pattern) * fOut / phaseDen
+    // (~2509 Hz) and its harmonics, producing sidebands at that comb +/- f0.
+    val slipEvents = ((params.phaseNum + params.phaseDen - 1) / params.phaseDen) *
+      params.phaseDen - params.phaseNum
+    val slipRate = slipEvents * outHz / params.phaseDen
     for (k <- 1 to 2) {
       val lo = goertzel(captured.toSeq, k * slipRate - f0, outHz)
       val hi = goertzel(captured.toSeq, k * slipRate + f0, outHz)
@@ -152,7 +148,7 @@ class ResamplerChainSpec extends AnyFunSuite {
     }
 
     // Fundamental must pass at the chain gain (square fundamental = 4/pi * amplitude).
-    val expectedFund = 16384.0 * 4.0 / math.Pi * chainDcGain
+    val expectedFund = 16384.0 * 4.0 / math.Pi * params.chainDcGain
     assert(math.abs(newFund - expectedFund) / expectedFund < 0.1,
       s"fundamental level wrong: $newFund vs $expectedFund")
     // The old path folds the 9th harmonic at roughly -19 dB rel; the new path must

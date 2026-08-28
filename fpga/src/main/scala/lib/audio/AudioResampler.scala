@@ -43,8 +43,35 @@ case class AudioResamplerParams(
   val phaseNum: Int = rawNum / divisor
   val phaseDen: Int = rawDen / divisor
 
+  private val divisorCore = BigInt(phaseNum * cicDecimation).gcd(BigInt(phaseDen)).toInt
+  /** Exact rational ratio coreClock / outputRate, for pacing output strobes. */
+  val corePerOutputNum: Int = phaseNum * cicDecimation / divisorCore
+  val corePerOutputDen: Int = phaseDen / divisorCore
+
+  /** Bit widths and design constants shared by the chain and its tests. */
+  val inputBits = 16
+  val intermediateBits = 18
+  val coeffBits = 18
+  val firTaps = 75
+  /** Chain DC gain: ~1 dB below unity, leaving headroom for FIR ringing and cubic
+   *  interpolation overshoot ahead of the output saturation. */
+  val chainDcGain = 0.89
+  /** The FIR normalizes the CIC's non-power-of-two gain to the chain target. */
+  val firDcGain: Double =
+    chainDcGain / CicDecimator.gain(inputBits, order = 3, cicDecimation, intermediateBits)
+  val firCoeffs: Seq[BigInt] = FirDesign.kaiserLowpass(
+    numTaps = firTaps,
+    cutoffNorm = 23_000.0 / intermediateRateHz,
+    beta = 6.0,
+    dcGain = firDcGain,
+    coeffBits = coeffBits,
+  )
+
   require(intermediateRateHz / outputRateHz > 3.0 && intermediateRateHz / outputRateHz < 6.0,
     "intermediate rate should be ~4x the output rate")
+  require(intermediateRateHz > 150_000.0 && intermediateRateHz < 250_000.0,
+    "FIR design point assumes a ~190 kHz intermediate rate")
+  require(phaseDen <= 1024, "phaseDen out of range for the interpolator's fraction")
 }
 
 /**
@@ -78,24 +105,7 @@ case class AudioResamplerParams(
  */
 
 class AudioResampler(params: AudioResamplerParams) extends Module {
-  private val inputBits = 16
-  private val intermediateBits = 18
-  private val coeffBits = 18
-  private val firTaps = 75
-
-  // Chain DC gain: ~1 dB below unity, leaving headroom for FIR ringing and cubic
-  // interpolation overshoot ahead of the output saturation.
-  private val chainDcGain = 0.89
-  // The FIR normalizes the CIC's non-power-of-two gain to the chain target.
-  private val firDcGain =
-    chainDcGain / CicDecimator.gain(inputBits, order = 3, params.cicDecimation, intermediateBits)
-  val firCoeffs: Seq[BigInt] = FirDesign.kaiserLowpass(
-    numTaps = firTaps,
-    cutoffNorm = 23_000.0 / params.intermediateRateHz,
-    beta = 6.0,
-    dcGain = firDcGain,
-    coeffBits = coeffBits,
-  )
+  import params.{coeffBits, firCoeffs, inputBits, intermediateBits}
 
   val io = IO(new Bundle {
     /** Emulator core clock domain */
@@ -159,7 +169,7 @@ class AudioResampler(params: AudioResamplerParams) extends Module {
       blocker.io.in := x
       blocker.io.out
     }
-    io.left := FirFilter.saturate(dcBlock(interpolator.io.outLeft, interpolator.io.outValid), inputBits)
-    io.right := FirFilter.saturate(dcBlock(interpolator.io.outRight, interpolator.io.outValid), inputBits)
+    io.left := Saturate(dcBlock(interpolator.io.outLeft, interpolator.io.outValid), inputBits)
+    io.right := Saturate(dcBlock(interpolator.io.outRight, interpolator.io.outValid), inputBits)
   }
 }

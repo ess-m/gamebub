@@ -35,16 +35,11 @@ class CicDecimatorSpec extends AnyFunSuite {
 }
 
 class FirFilterSpec extends AnyFunSuite {
-  private val dataBits = 18
-  private val coeffBits = 18
-  // Same design point as the real instantiation (fs = 190.66 kHz).
-  private val coeffs = FirDesign.kaiserLowpass(
-    numTaps = 75,
-    cutoffNorm = 23_000.0 / 190_662.0,
-    beta = 6.0,
-    dcGain = 1.0 / CicDecimator.gain(16, 3, 88, 18),
-    coeffBits = coeffBits,
-  )
+  // The shipped design point, shared through the params (GBA, rev 4).
+  private val params = AudioResamplerParams(56, 32, 608)
+  private val dataBits = params.intermediateBits
+  private val coeffBits = params.coeffBits
+  private val coeffs = params.firCoeffs
 
   test("produces the exact expected DC response") {
     simulate(new FirFilter(dataBits, coeffBits, coeffs)) { dut =>
@@ -75,14 +70,14 @@ class FirFilterSpec extends AnyFunSuite {
   }
 
   test("designed coefficients are sane") {
-    // DC gain must compensate the CIC gain to unity within quantization error.
+    // The FIR's DC gain and the CIC gain must multiply out to the chain target.
     val dcGain = coeffs.sum.toDouble / (1L << (coeffBits - 1))
-    val cicGain = CicDecimator.gain(16, 3, 88, 18)
-    assert(math.abs(dcGain * cicGain - 1.0) < 1e-3)
+    val cicGain = CicDecimator.gain(params.inputBits, 3, params.cicDecimation, params.intermediateBits)
+    assert(math.abs(dcGain * cicGain - params.chainDcGain) < 1e-3)
   }
 
   test("quantized filter meets its passband/stopband spec") {
-    val fs = 190_662.0
+    val fs = params.intermediateRateHz
     def magnitudeDb(f: Double): Double = {
       val w = 2.0 * math.Pi * f / fs
       val re = coeffs.zipWithIndex.map { case (c, i) => c.toDouble * math.cos(w * i) }.sum

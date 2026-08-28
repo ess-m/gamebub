@@ -162,7 +162,7 @@ class RateInterpolator(
     }
     is (sOutput) {
       for (ch <- 0 until channels) {
-        outReg(ch) := FirFilter.saturate(window(ch)(1) +& (horner(ch) >> 1), outputBits)
+        outReg(ch) := Saturate(window(ch)(1) +& (horner(ch) >> 1), outputBits)
       }
       outValidReg := true.B
       state := sIdle

@@ -3,16 +3,6 @@ package lib.audio
 import chisel3._
 import chisel3.util._
 
-object FirFilter {
-  /** Saturate a wide signed value into `bits` bits. */
-  def saturate(x: SInt, bits: Int): SInt = {
-    val max = ((BigInt(1) << (bits - 1)) - 1).S
-    val min = (-(BigInt(1) << (bits - 1))).S
-    Mux(x > max, max(bits - 1, 0).asSInt,
-      Mux(x < min, min(bits - 1, 0).asSInt, x(bits - 1, 0).asSInt))
-  }
-}
-
 /**
  * Serial symmetric FIR filter: one multiply-accumulate per clock cycle, exploiting
  * linear-phase coefficient symmetry with a pre-adder (maps to a single DSP slice).
@@ -74,7 +64,7 @@ class FirFilter(
     // Tap k pairs with its mirror tap (numTaps - 1 - k); the center tap stands alone.
     val x1 = samples.read(tapIndex(k))
     val x2 = samples.read(tapIndex((numTaps - 1).U - k))
-    val pair = Mux(k === center.U, x1 +& 0.S, x1 +& x2)
+    val pair = Mux(k === center.U, x1, x1 +& x2)
     acc := acc + (pair * coeffRom(k))
     when (k === center.U) {
       busy := false.B
@@ -89,7 +79,7 @@ class FirFilter(
   val outValid = RegInit(false.B)
   outValid := false.B
   when (finishing) {
-    outReg := FirFilter.saturate(acc >> (coeffBits - 1), dataBits)
+    outReg := Saturate(acc >> (coeffBits - 1), dataBits)
     outValid := true.B
   }
   io.out.bits := outReg
