@@ -83,9 +83,12 @@ class AudioResampler(params: AudioResamplerParams) extends Module {
   private val coeffBits = 18
   private val firTaps = 75
 
-  // The FIR's DC gain compensates the CIC gain so the whole chain is unity at DC.
+  // Chain DC gain: ~1 dB below unity, leaving headroom for FIR ringing and cubic
+  // interpolation overshoot ahead of the output saturation.
+  private val chainDcGain = 0.89
+  // The FIR normalizes the CIC's non-power-of-two gain to the chain target.
   private val firDcGain =
-    1.0 / CicDecimator.gain(inputBits, order = 3, params.cicDecimation, intermediateBits)
+    chainDcGain / CicDecimator.gain(inputBits, order = 3, params.cicDecimation, intermediateBits)
   val firCoeffs: Seq[BigInt] = FirDesign.kaiserLowpass(
     numTaps = firTaps,
     cutoffNorm = 23_000.0 / params.intermediateRateHz,

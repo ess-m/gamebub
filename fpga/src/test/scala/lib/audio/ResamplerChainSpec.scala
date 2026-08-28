@@ -64,11 +64,12 @@ class ResamplerChainSpec extends AnyFunSuite {
   private val coreHz = 50_000_000.0 / 3.0 * 56.375 / 56.0
   private val outHz = coreHz * 7.0 / 2432.0
 
+  private val chainDcGain = 0.89
   private val coeffs = FirDesign.kaiserLowpass(
     numTaps = 75,
     cutoffNorm = 23_000.0 / (coreHz / 88.0),
     beta = 6.0,
-    dcGain = 1.0 / CicDecimator.gain(16, 3, 88, 18),
+    dcGain = chainDcGain / CicDecimator.gain(16, 3, 88, 18),
     coeffBits = 18,
   )
 
@@ -150,8 +151,8 @@ class ResamplerChainSpec extends AnyFunSuite {
         f"phase-slip sidebands present at k=$k: ${db(lo / newFund)}%.1f / ${db(hi / newFund)}%.1f dB")
     }
 
-    // Fundamental must pass at unity (square fundamental = 4/pi * amplitude).
-    val expectedFund = 16384.0 * 4.0 / math.Pi
+    // Fundamental must pass at the chain gain (square fundamental = 4/pi * amplitude).
+    val expectedFund = 16384.0 * 4.0 / math.Pi * chainDcGain
     assert(math.abs(newFund - expectedFund) / expectedFund < 0.1,
       s"fundamental level wrong: $newFund vs $expectedFund")
     // The old path folds the 9th harmonic at roughly -19 dB rel; the new path must
