@@ -31,7 +31,10 @@ class RateInterpolator(
     "phaseDen too large for Q0.16 fraction")
 
   private val ringBits = 4 // 16-entry ring buffer
-  private val prefill = 6
+  
+  // Sets the steady-state occupancy. Must exceed the window guard (4) by more than the
+  // consume pattern's swing (~ceil(ratio)), or consumption stalls into periodic phase slips.
+  private val prefill = 10
   // Q0.16 fraction = acc * tRecip, computed with an elaboration-time reciprocal.
   private val tRecip = math.round(65536.0 / phaseDen).toInt
   private val accBits = log2Ceil(phaseNum + phaseDen) + 1
@@ -117,7 +120,9 @@ class RateInterpolator(
         acc := acc - phaseDen.U
         readPtr := readPtr + 1.U
       } .otherwise {
-        tFrac := (acc * tRecip.U)(15, 0)
+        // acc < phaseDen here in normal operation; if the occupancy guard ever stalls
+        // consumption, acc can exceed phaseDen -- saturate the fraction rather than wrap.
+        tFrac := Mux(acc >= phaseDen.U, 0xFFFF.U, (acc * tRecip.U)(15, 0))
         step := 0.U
         state := sLoad
       }
